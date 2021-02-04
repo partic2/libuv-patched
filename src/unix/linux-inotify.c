@@ -71,10 +71,14 @@ static int init_inotify(uv_loop_t* loop) {
   if (loop->inotify_fd != -1)
     return 0;
 
-  fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+  fd = inotify_init();
   if (fd < 0)
     return UV__ERR(errno);
 
+  int flags = fcntl(fd, F_GETFL, 0);
+  flags |= O_NONBLOCK|O_CLOEXEC;
+  fcntl(fd,F_SETFL,flags);
+  
   loop->inotify_fd = fd;
   uv__io_init(&loop->inotify_read_watcher, uv__inotify_read, loop->inotify_fd);
   uv__io_start(loop, &loop->inotify_read_watcher, POLLIN);

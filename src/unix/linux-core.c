@@ -85,7 +85,10 @@ static uint64_t read_cpufreq(unsigned int cpunum);
 
 int uv__platform_loop_init(uv_loop_t* loop) {
   int fd;
-  fd = epoll_create1(O_CLOEXEC);
+  
+  
+  //fd = epoll_create1(O_CLOEXEC);
+  fd=-1;
 
   /* epoll_create1() can fail either because it's not implemented (old kernel)
    * or because it doesn't understand the O_CLOEXEC flag.
@@ -187,6 +190,13 @@ int uv__io_check_fd(uv_loop_t* loop, int fd) {
   return rc;
 }
 
+static uv__epoll_pwait(int epfd, struct epoll_event *events,int maxevents, int timeout,const sigset_t *sigmask){
+  sigset_t origmask;
+  pthread_sigmask(SIG_SETMASK, sigmask, &origmask);
+  int ready = epoll_wait(epfd, events, maxevents, timeout);
+  pthread_sigmask(SIG_SETMASK, &origmask, NULL);
+  return ready;
+}
 
 void uv__io_poll(uv_loop_t* loop, int timeout) {
   /* A bug in kernels < 2.6.37 makes timeouts larger than ~30 minutes
@@ -311,7 +321,7 @@ void uv__io_poll(uv_loop_t* loop, int timeout) {
         abort();
 
     if (no_epoll_wait != 0 || (sigmask != 0 && no_epoll_pwait == 0)) {
-      nfds = epoll_pwait(loop->backend_fd,
+      nfds = uv__epoll_pwait(loop->backend_fd,
                          events,
                          ARRAY_SIZE(events),
                          timeout,

@@ -11,6 +11,7 @@ include(CMakeDependentOption)
 include(CheckCCompilerFlag)
 include(GNUInstallDirs)
 include(CTest)
+include(CheckSymbolExists)
 
 set(CMAKE_C_VISIBILITY_PRESET hidden)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -181,6 +182,7 @@ else()
        src/unix/thread.c
        src/unix/tty.c
        src/unix/udp.c)
+  
   list(APPEND uv_test_sources test/runner-unix.c)
 endif()
 
