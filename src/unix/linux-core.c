@@ -190,7 +190,7 @@ int uv__io_check_fd(uv_loop_t* loop, int fd) {
   return rc;
 }
 
-static uv__epoll_pwait(int epfd, struct epoll_event *events,int maxevents, int timeout,const sigset_t *sigmask){
+static int uv__epoll_pwait(int epfd, struct epoll_event *events,int maxevents, int timeout,const sigset_t *sigmask){
   sigset_t origmask;
   pthread_sigmask(SIG_SETMASK, sigmask, &origmask);
   int ready = epoll_wait(epfd, events, maxevents, timeout);
