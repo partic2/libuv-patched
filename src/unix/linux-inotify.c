@@ -75,9 +75,8 @@ static int init_inotify(uv_loop_t* loop) {
   if (fd < 0)
     return UV__ERR(errno);
 
-  int flags = fcntl(fd, F_GETFL, 0);
-  flags |= O_NONBLOCK|O_CLOEXEC;
-  fcntl(fd,F_SETFL,flags);
+  uv__cloexec(fd,1);
+  uv__nonblock(fd,1);
   
   loop->inotify_fd = fd;
   uv__io_init(&loop->inotify_read_watcher, uv__inotify_read, loop->inotify_fd);

@@ -88,12 +88,12 @@ int uv__platform_loop_init(uv_loop_t* loop) {
   
   
   //fd = epoll_create1(O_CLOEXEC);
-  fd=-1;
 
   /* epoll_create1() can fail either because it's not implemented (old kernel)
    * or because it doesn't understand the O_CLOEXEC flag.
    */
-  if (fd == -1 && (errno == ENOSYS || errno == EINVAL)) {
+  // if (fd == -1 && (errno == ENOSYS || errno == EINVAL)) {
+  {
     fd = epoll_create(256);
 
     if (fd != -1)
@@ -190,11 +190,17 @@ int uv__io_check_fd(uv_loop_t* loop, int fd) {
   return rc;
 }
 
+
+pthread_mutex_t uv__epoll_pwait_lock;
 static int uv__epoll_pwait(int epfd, struct epoll_event *events,int maxevents, int timeout,const sigset_t *sigmask){
   sigset_t origmask;
+  pthread_mutex_init(&uv__epoll_pwait_lock,NULL);
+  pthread_mutex_lock(&uv__epoll_pwait_lock);
   pthread_sigmask(SIG_SETMASK, sigmask, &origmask);
   int ready = epoll_wait(epfd, events, maxevents, timeout);
   pthread_sigmask(SIG_SETMASK, &origmask, NULL);
+  pthread_mutex_unlock(&uv__epoll_pwait_lock);
+  pthread_mutex_destroy(&uv__epoll_pwait_lock);
   return ready;
 }
 
