@@ -1,6 +1,6 @@
 
 
-# LIBUV_SOURCE_ROOT='C:\Users\Public\fs\msys\home\repo-storage\libuv-patched/'
+# LIBUV_SOURCE_ROOT='C:\Users\Public\fs\msys\home\repo-storage\libuv-patched'
 
 LDFLAGS="$LDLAGS  -ldl "
 CFLAGS="$CFLAGS  -D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE -D_GNU_SOURCE -I${LIBUV_SOURCE_ROOT}/include -I${LIBUV_SOURCE_ROOT}/src"

@@ -1,6 +1,6 @@
 
 
-# LIBUV_SOURCE_ROOT='C:\Users\Public\fs\msys\home\repo-storage\libuv-patched/'
+# LIBUV_SOURCE_ROOT='C:\Users\Public\fs\msys\home\repo-storage\libuv-patched'
 
 LDFLAGS="$LDLAGS  -lpsapi -luser32 -ladvapi32 -liphlpapi -luserenv -lws2_32 "
 CFLAGS="$CFLAGS  -DWIN32_LEAN_AND_MEAN -D_WIN32_WINNT=0x0602 -I${LIBUV_SOURCE_ROOT}/include -I${LIBUV_SOURCE_ROOT}/src"
