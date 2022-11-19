@@ -219,16 +219,6 @@ static void realpath_cb(uv_fs_t* req) {
   char test_file_abs_buf[PATHMAX];
   size_t test_file_abs_size = sizeof(test_file_abs_buf);
   ASSERT(req->fs_type == UV_FS_REALPATH);
-#ifdef _WIN32
-  /*
-   * Windows XP and Server 2003 don't support GetFinalPathNameByHandleW()
-   */
-  if (req->result == UV_ENOSYS) {
-    realpath_cb_count++;
-    uv_fs_req_cleanup(req);
-    return;
-  }
-#endif
   ASSERT(req->result == 0);
 
   uv_cwd(test_file_abs_buf, &test_file_abs_size);
@@ -343,7 +333,7 @@ static void statfs_cb(uv_fs_t* req) {
 
   ASSERT(req->fs_type == UV_FS_STATFS);
   ASSERT(req->result == 0);
-  ASSERT(req->ptr != NULL);
+  ASSERT_NOT_NULL(req->ptr);
   stats = req->ptr;
 
 #if defined(_WIN32) || defined(__sun) || defined(_AIX) || defined(__MVS__) || \
@@ -366,7 +356,7 @@ static void statfs_cb(uv_fs_t* req) {
   ASSERT(stats->f_ffree <= stats->f_files);
 #endif
   uv_fs_req_cleanup(req);
-  ASSERT(req->ptr == NULL);
+  ASSERT_NULL(req->ptr);
   statfs_cb_count++;
 }
 
@@ -630,7 +620,7 @@ static void empty_scandir_cb(uv_fs_t* req) {
   ASSERT(req == &scandir_req);
   ASSERT(req->fs_type == UV_FS_SCANDIR);
   ASSERT(req->result == 0);
-  ASSERT(req->ptr == NULL);
+  ASSERT_NULL(req->ptr);
   ASSERT(UV_EOF == uv_fs_scandir_next(req, &dent));
   uv_fs_req_cleanup(req);
   scandir_cb_count++;
@@ -642,7 +632,7 @@ static void non_existent_scandir_cb(uv_fs_t* req) {
   ASSERT(req == &scandir_req);
   ASSERT(req->fs_type == UV_FS_SCANDIR);
   ASSERT(req->result == UV_ENOENT);
-  ASSERT(req->ptr == NULL);
+  ASSERT_NULL(req->ptr);
   ASSERT(UV_ENOENT == uv_fs_scandir_next(req, &dent));
   uv_fs_req_cleanup(req);
   scandir_cb_count++;
@@ -653,7 +643,7 @@ static void file_scandir_cb(uv_fs_t* req) {
   ASSERT(req == &scandir_req);
   ASSERT(req->fs_type == UV_FS_SCANDIR);
   ASSERT(req->result == UV_ENOTDIR);
-  ASSERT(req->ptr == NULL);
+  ASSERT_NULL(req->ptr);
   uv_fs_req_cleanup(req);
   scandir_cb_count++;
 }
@@ -770,11 +760,10 @@ TEST_IMPL(fs_file_loop) {
   r = uv_fs_symlink(NULL, &req, "test_symlink", "test_symlink", 0, NULL);
 #ifdef _WIN32
   /*
-   * Windows XP and Server 2003 don't support symlinks; we'll get UV_ENOTSUP.
-   * Starting with vista they are supported, but only when elevated, otherwise
+   * Symlinks are only suported but only when elevated, otherwise
    * we'll see UV_EPERM.
    */
-  if (r == UV_ENOTSUP || r == UV_EPERM)
+  if (r == UV_EPERM)
     return 0;
 #elif defined(__MSYS__)
   /* MSYS2's approximation of symlinks with copies does not work for broken
@@ -844,14 +833,19 @@ static void check_utime(const char* path,
   } else {
     double st_atim;
     double st_mtim;
-#ifndef __APPLE__
+#if !defined(__APPLE__) && !defined(__SUNPRO_C)
     /* TODO(vtjnash): would it be better to normalize this? */
     ASSERT_DOUBLE_GE(s->st_atim.tv_nsec, 0);
     ASSERT_DOUBLE_GE(s->st_mtim.tv_nsec, 0);
 #endif
     st_atim = s->st_atim.tv_sec + s->st_atim.tv_nsec / 1e9;
     st_mtim = s->st_mtim.tv_sec + s->st_mtim.tv_nsec / 1e9;
-    ASSERT_DOUBLE_EQ(st_atim, atime);
+    /*
+     * Linux does not allow reading reliably the atime of a symlink
+     * since readlink() can update it
+     */
+    if (!test_lutime)
+      ASSERT_DOUBLE_EQ(st_atim, atime);
     ASSERT_DOUBLE_EQ(st_mtim, mtime);
   }
 
@@ -1234,6 +1228,8 @@ static int test_sendfile(void (*setup)(int), uv_fs_cb cb, off_t expected_size) {
   ASSERT(r == 0);
   uv_fs_req_cleanup(&close_req);
 
+  memset(&s1, 0, sizeof(s1));
+  memset(&s2, 0, sizeof(s2));
   ASSERT(0 == stat("test_file", &s1));
   ASSERT(0 == stat("test_file2", &s2));
   ASSERT(s2.st_size == expected_size);
@@ -1388,6 +1384,13 @@ TEST_IMPL(fs_fstat) {
   struct stat t;
 #endif
 
+#if defined(__s390__) && defined(__QEMU__)
+  /* qemu-user-s390x has this weird bug where statx() reports nanoseconds
+   * but plain fstat() does not.
+   */
+  RETURN_SKIP("Test does not currently work in QEMU");
+#endif
+
   /* Setup. */
   unlink("test_file");
 
@@ -1401,6 +1404,7 @@ TEST_IMPL(fs_fstat) {
   uv_fs_req_cleanup(&req);
 
 #ifndef _WIN32
+  memset(&t, 0, sizeof(t));
   ASSERT(0 == fstat(file, &t));
   ASSERT(0 == uv_fs_fstat(NULL, &req, file, NULL));
   ASSERT(req.result == 0);
@@ -1453,7 +1457,8 @@ TEST_IMPL(fs_fstat) {
   ASSERT(s->st_mtim.tv_nsec == t.st_mtimespec.tv_nsec);
   ASSERT(s->st_ctim.tv_sec == t.st_ctimespec.tv_sec);
   ASSERT(s->st_ctim.tv_nsec == t.st_ctimespec.tv_nsec);
-#elif defined(_AIX)
+#elif defined(_AIX)    || \
+      defined(__MVS__)
   ASSERT(s->st_atim.tv_sec == t.st_atime);
   ASSERT(s->st_atim.tv_nsec == 0);
   ASSERT(s->st_mtim.tv_sec == t.st_mtime);
@@ -2011,12 +2016,12 @@ TEST_IMPL(fs_readlink) {
   ASSERT(0 == uv_fs_readlink(loop, &req, "no_such_file", dummy_cb));
   ASSERT(0 == uv_run(loop, UV_RUN_DEFAULT));
   ASSERT(dummy_cb_count == 1);
-  ASSERT(req.ptr == NULL);
+  ASSERT_NULL(req.ptr);
   ASSERT(req.result == UV_ENOENT);
   uv_fs_req_cleanup(&req);
 
   ASSERT(UV_ENOENT == uv_fs_readlink(NULL, &req, "no_such_file", NULL));
-  ASSERT(req.ptr == NULL);
+  ASSERT_NULL(req.ptr);
   ASSERT(req.result == UV_ENOENT);
   uv_fs_req_cleanup(&req);
 
@@ -2032,21 +2037,12 @@ TEST_IMPL(fs_realpath) {
   ASSERT(0 == uv_fs_realpath(loop, &req, "no_such_file", dummy_cb));
   ASSERT(0 == uv_run(loop, UV_RUN_DEFAULT));
   ASSERT(dummy_cb_count == 1);
-  ASSERT(req.ptr == NULL);
-#ifdef _WIN32
-  /*
-   * Windows XP and Server 2003 don't support GetFinalPathNameByHandleW()
-   */
-  if (req.result == UV_ENOSYS) {
-    uv_fs_req_cleanup(&req);
-    RETURN_SKIP("realpath is not supported on Windows XP");
-  }
-#endif
+  ASSERT_NULL(req.ptr);
   ASSERT(req.result == UV_ENOENT);
   uv_fs_req_cleanup(&req);
 
   ASSERT(UV_ENOENT == uv_fs_realpath(NULL, &req, "no_such_file", NULL));
-  ASSERT(req.ptr == NULL);
+  ASSERT_NULL(req.ptr);
   ASSERT(req.result == UV_ENOENT);
   uv_fs_req_cleanup(&req);
 
@@ -2152,15 +2148,6 @@ TEST_IMPL(fs_symlink) {
   uv_fs_req_cleanup(&req);
 
   r = uv_fs_realpath(NULL, &req, "test_file_symlink_symlink", NULL);
-#ifdef _WIN32
-  /*
-   * Windows XP and Server 2003 don't support GetFinalPathNameByHandleW()
-   */
-  if (r == UV_ENOSYS) {
-    uv_fs_req_cleanup(&req);
-    RETURN_SKIP("realpath is not supported on Windows XP");
-  }
-#endif
   ASSERT(r == 0);
 #ifdef _WIN32
   ASSERT(stricmp(req.ptr, test_file_abs_buf) == 0);
@@ -2210,15 +2197,6 @@ TEST_IMPL(fs_symlink) {
   ASSERT(readlink_cb_count == 1);
 
   r = uv_fs_realpath(loop, &req, "test_file", realpath_cb);
-#ifdef _WIN32
-  /*
-   * Windows XP and Server 2003 don't support GetFinalPathNameByHandleW()
-   */
-  if (r == UV_ENOSYS) {
-    uv_fs_req_cleanup(&req);
-    RETURN_SKIP("realpath is not supported on Windows XP");
-  }
-#endif
   ASSERT(r == 0);
   uv_run(loop, UV_RUN_DEFAULT);
   ASSERT(realpath_cb_count == 1);
@@ -2319,15 +2297,6 @@ int test_symlink_dir_impl(int type) {
   uv_fs_req_cleanup(&req);
 
   r = uv_fs_realpath(NULL, &req, "test_dir_symlink", NULL);
-#ifdef _WIN32
-  /*
-   * Windows XP and Server 2003 don't support GetFinalPathNameByHandleW()
-   */
-  if (r == UV_ENOSYS) {
-    uv_fs_req_cleanup(&req);
-    RETURN_SKIP("realpath is not supported on Windows XP");
-  }
-#endif
   ASSERT(r == 0);
 #ifdef _WIN32
   ASSERT(strlen(req.ptr) == test_dir_abs_size - 5);
@@ -2843,7 +2812,7 @@ TEST_IMPL(fs_scandir_empty_dir) {
   r = uv_fs_scandir(NULL, &req, path, 0, NULL);
   ASSERT(r == 0);
   ASSERT(req.result == 0);
-  ASSERT(req.ptr == NULL);
+  ASSERT_NULL(req.ptr);
   ASSERT(UV_EOF == uv_fs_scandir_next(&req, &dent));
   uv_fs_req_cleanup(&req);
 
@@ -2880,7 +2849,7 @@ TEST_IMPL(fs_scandir_non_existent_dir) {
   r = uv_fs_scandir(NULL, &req, path, 0, NULL);
   ASSERT(r == UV_ENOENT);
   ASSERT(req.result == UV_ENOENT);
-  ASSERT(req.ptr == NULL);
+  ASSERT_NULL(req.ptr);
   ASSERT(UV_ENOENT == uv_fs_scandir_next(&req, &dent));
   uv_fs_req_cleanup(&req);
 
@@ -2896,9 +2865,6 @@ TEST_IMPL(fs_scandir_non_existent_dir) {
 }
 
 TEST_IMPL(fs_scandir_file) {
-#if defined(__ASAN__)
-  RETURN_SKIP("Test does not currently work in ASAN");
-#endif
   const char* path;
   int r;
 
@@ -2921,6 +2887,24 @@ TEST_IMPL(fs_scandir_file) {
 }
 
 
+/* Run in Valgrind. Should not leak when the iterator isn't exhausted. */
+TEST_IMPL(fs_scandir_early_exit) {
+  uv_dirent_t d;
+  uv_fs_t req;
+
+  ASSERT_LT(0, uv_fs_scandir(NULL, &req, "test/fixtures/one_file", 0, NULL));
+  ASSERT_NE(UV_EOF, uv_fs_scandir_next(&req, &d));
+  uv_fs_req_cleanup(&req);
+
+  ASSERT_LT(0, uv_fs_scandir(NULL, &req, "test/fixtures", 0, NULL));
+  ASSERT_NE(UV_EOF, uv_fs_scandir_next(&req, &d));
+  uv_fs_req_cleanup(&req);
+
+  MAKE_VALGRIND_HAPPY();
+  return 0;
+}
+
+
 TEST_IMPL(fs_open_dir) {
   const char* path;
   uv_fs_t req;
@@ -2932,7 +2916,7 @@ TEST_IMPL(fs_open_dir) {
   r = uv_fs_open(NULL, &req, path, O_RDONLY, 0, NULL);
   ASSERT(r >= 0);
   ASSERT(req.result >= 0);
-  ASSERT(req.ptr == NULL);
+  ASSERT_NULL(req.ptr);
   file = r;
   uv_fs_req_cleanup(&req);
 
@@ -3145,9 +3129,6 @@ static void fs_read_bufs(int add_flags) {
   uv_fs_req_cleanup(&close_req);
 }
 TEST_IMPL(fs_read_bufs) {
-#if defined(__ASAN__)
-  RETURN_SKIP("Test does not currently work in ASAN");
-#endif
   fs_read_bufs(0);
   fs_read_bufs(UV_FS_O_FILEMAP);
 
@@ -3332,7 +3313,7 @@ static void fs_write_alotof_bufs(int add_flags) {
   loop = uv_default_loop();
 
   iovs = malloc(sizeof(*iovs) * iovcount);
-  ASSERT(iovs != NULL);
+  ASSERT_NOT_NULL(iovs);
   iovmax = uv_test_getiovmax();
 
   r = uv_fs_open(NULL,
@@ -3361,7 +3342,7 @@ static void fs_write_alotof_bufs(int add_flags) {
 
   /* Read the strings back to separate buffers. */
   buffer = malloc(sizeof(test_buf) * iovcount);
-  ASSERT(buffer != NULL);
+  ASSERT_NOT_NULL(buffer);
 
   for (index = 0; index < iovcount; ++index)
     iovs[index] = uv_buf_init(buffer + index * sizeof(test_buf),
@@ -3444,7 +3425,7 @@ static void fs_write_alotof_bufs_with_offset(int add_flags) {
   loop = uv_default_loop();
 
   iovs = malloc(sizeof(*iovs) * iovcount);
-  ASSERT(iovs != NULL);
+  ASSERT_NOT_NULL(iovs);
   iovmax = uv_test_getiovmax();
 
   r = uv_fs_open(NULL,
@@ -3480,7 +3461,7 @@ static void fs_write_alotof_bufs_with_offset(int add_flags) {
 
   /* Read the strings back to separate buffers. */
   buffer = malloc(sizeof(test_buf) * iovcount);
-  ASSERT(buffer != NULL);
+  ASSERT_NOT_NULL(buffer);
 
   for (index = 0; index < iovcount; ++index)
     iovs[index] = uv_buf_init(buffer + index * sizeof(test_buf),
@@ -3676,16 +3657,16 @@ static void test_fs_partial(int doread) {
   iovcount = 54321;
 
   iovs = malloc(sizeof(*iovs) * iovcount);
-  ASSERT(iovs != NULL);
+  ASSERT_NOT_NULL(iovs);
 
   ctx.pid = pthread_self();
   ctx.doread = doread;
   ctx.interval = 1000;
   ctx.size = sizeof(test_buf) * iovcount;
-  ctx.data = malloc(ctx.size);
-  ASSERT(ctx.data != NULL);
-  buffer = malloc(ctx.size);
-  ASSERT(buffer != NULL);
+  ctx.data = calloc(ctx.size, 1);
+  ASSERT_NOT_NULL(ctx.data);
+  buffer = calloc(ctx.size, 1);
+  ASSERT_NOT_NULL(buffer);
 
   for (index = 0; index < iovcount; ++index)
     iovs[index] = uv_buf_init(buffer + index * sizeof(test_buf), sizeof(test_buf));
@@ -3773,15 +3754,15 @@ TEST_IMPL(fs_read_write_null_arguments) {
   /* Validate some memory management on failed input validation before sending
      fs work to the thread pool. */
   ASSERT(r == UV_EINVAL);
-  ASSERT(write_req.path == NULL);
-  ASSERT(write_req.ptr == NULL);
+  ASSERT_NULL(write_req.path);
+  ASSERT_NULL(write_req.ptr);
 #ifdef _WIN32
-  ASSERT(write_req.file.pathw == NULL);
-  ASSERT(write_req.fs.info.new_pathw == NULL);
-  ASSERT(write_req.fs.info.bufs == NULL);
+  ASSERT_NULL(write_req.file.pathw);
+  ASSERT_NULL(write_req.fs.info.new_pathw);
+  ASSERT_NULL(write_req.fs.info.bufs);
 #else
-  ASSERT(write_req.new_path == NULL);
-  ASSERT(write_req.bufs == NULL);
+  ASSERT_NULL(write_req.new_path);
+  ASSERT_NULL(write_req.bufs);
 #endif
   uv_fs_req_cleanup(&write_req);
 

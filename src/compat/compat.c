@@ -1,29 +1,23 @@
-/*
-Copyright (c) 2013, Kenneth MacKay
-Copyright (c) 2014, Emergya (Cloud4all, FP7/2007-2013 grant agreement #289016)
-All rights reserved.
 
-Redistribution and use in source and binary forms, with or without modification,
-are permitted provided that the following conditions are met:
- * Redistributions of source code must retain the above copyright notice, this
-   list of conditions and the following disclaimer.
- * Redistributions in binary form must reproduce the above copyright notice,
-   this list of conditions and the following disclaimer in the documentation
-   and/or other materials provided with the distribution.
 
-THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
-ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
-WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
-ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
-(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
-LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
-ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
-SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-*/
 
-#include "uv/android-ifaddrs.h"
+#include "compat.h"
+
+
+#ifdef LIBUV_EMBEDDED_PREADV
+extern int preadv(int a0, void *a1, int a2, int a3){
+    return ENOSYS;
+}
+extern int pwritev(int a0, void *a1, int a2, int a3){
+     return ENOSYS;
+}
+#endif
+
+
+
+#ifdef LIBUV_EMBEDDED_GETIFADDR
+
+#include "../unix/internal.h"
 #include "uv-common.h"
 
 #include <string.h>
@@ -711,3 +705,103 @@ void freeifaddrs(struct ifaddrs *ifa)
         uv__free(l_cur);
     }
 }
+#endif
+
+#ifdef LIBUV_REPLACE_uv_interface_addresses
+
+
+static int uv__ifaddr_exclude(struct ifaddrs *ent, int exclude_type) {
+  if (!((ent->ifa_flags & IFF_UP) && (ent->ifa_flags & IFF_RUNNING)))
+    return 1;
+  if (ent->ifa_addr == NULL)
+    return 1;
+  /*
+   * On Linux getifaddrs returns information related to the raw underlying
+   * devices. We're not interested in this information yet.
+   */
+  if (ent->ifa_addr->sa_family == PF_PACKET)
+    return exclude_type;
+  return !exclude_type;
+}
+#undef uv_interface_addresses
+UV_EXTERN int uv_interface_addresses(uv_interface_address_t** addresses, int* count) {
+  struct ifaddrs *addrs, *ent;
+  uv_interface_address_t* address;
+  int i;
+  struct sockaddr_ll *sll;
+
+  *count = 0;
+  *addresses = NULL;
+
+  if (getifaddrs(&addrs))
+    return UV__ERR(errno);
+
+  /* Count the number of interfaces */
+  for (ent = addrs; ent != NULL; ent = ent->ifa_next) {
+    if (uv__ifaddr_exclude(ent, UV__EXCLUDE_IFADDR))
+      continue;
+
+    (*count)++;
+  }
+
+  if (*count == 0) {
+    freeifaddrs(addrs);
+    return 0;
+  }
+
+  /* Make sure the memory is initiallized to zero using calloc() */
+  *addresses = uv__calloc(*count, sizeof(**addresses));
+  if (!(*addresses)) {
+    freeifaddrs(addrs);
+    return UV_ENOMEM;
+  }
+
+  address = *addresses;
+
+  for (ent = addrs; ent != NULL; ent = ent->ifa_next) {
+    if (uv__ifaddr_exclude(ent, UV__EXCLUDE_IFADDR))
+      continue;
+
+    address->name = uv__strdup(ent->ifa_name);
+
+    if (ent->ifa_addr->sa_family == AF_INET6) {
+      address->address.address6 = *((struct sockaddr_in6*) ent->ifa_addr);
+    } else {
+      address->address.address4 = *((struct sockaddr_in*) ent->ifa_addr);
+    }
+
+    if (ent->ifa_netmask->sa_family == AF_INET6) {
+      address->netmask.netmask6 = *((struct sockaddr_in6*) ent->ifa_netmask);
+    } else {
+      address->netmask.netmask4 = *((struct sockaddr_in*) ent->ifa_netmask);
+    }
+
+    address->is_internal = !!(ent->ifa_flags & IFF_LOOPBACK);
+
+    address++;
+  }
+
+  /* Fill in physical addresses for each interface */
+  for (ent = addrs; ent != NULL; ent = ent->ifa_next) {
+    if (uv__ifaddr_exclude(ent, UV__EXCLUDE_IFPHYS))
+      continue;
+
+    address = *addresses;
+
+    for (i = 0; i < (*count); i++) {
+      size_t namelen = strlen(ent->ifa_name);
+      /* Alias interface share the same physical address */
+      if (strncmp(address->name, ent->ifa_name, namelen) == 0 &&
+          (address->name[namelen] == 0 || address->name[namelen] == ':')) {
+        sll = (struct sockaddr_ll*)ent->ifa_addr;
+        memcpy(address->phys_addr, sll->sll_addr, sizeof(address->phys_addr));
+      }
+      address++;
+    }
+  }
+
+  freeifaddrs(addrs);
+
+  return 0;
+}
+#endif

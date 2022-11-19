@@ -34,16 +34,98 @@
 #include <assert.h>
 #include <errno.h>
 
+#include <fcntl.h>
 #include <net/if.h>
 #include <sys/epoll.h>
+#include <sys/inotify.h>
 #include <sys/param.h>
 #include <sys/prctl.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/sysinfo.h>
-#include <unistd.h>
-#include <fcntl.h>
+#include <sys/types.h>
 #include <time.h>
+#include <unistd.h>
+
+#if defined(__arm__)
+# if defined(__thumb__) || defined(__ARM_EABI__)
+#  define UV_SYSCALL_BASE 0
+# else
+#  define UV_SYSCALL_BASE 0x900000
+# endif
+#endif /* __arm__ */
+
+#ifndef __NR_recvmmsg
+# if defined(__x86_64__)
+#  define __NR_recvmmsg 299
+# elif defined(__arm__)
+#  define __NR_recvmmsg (UV_SYSCALL_BASE + 365)
+# endif
+#endif /* __NR_recvmsg */
+
+#ifndef __NR_sendmmsg
+# if defined(__x86_64__)
+#  define __NR_sendmmsg 307
+# elif defined(__arm__)
+#  define __NR_sendmmsg (UV_SYSCALL_BASE + 374)
+# endif
+#endif /* __NR_sendmmsg */
+
+#ifndef __NR_copy_file_range
+# if defined(__x86_64__)
+#  define __NR_copy_file_range 326
+# elif defined(__i386__)
+#  define __NR_copy_file_range 377
+# elif defined(__s390__)
+#  define __NR_copy_file_range 375
+# elif defined(__arm__)
+#  define __NR_copy_file_range (UV_SYSCALL_BASE + 391)
+# elif defined(__aarch64__)
+#  define __NR_copy_file_range 285
+# elif defined(__powerpc__)
+#  define __NR_copy_file_range 379
+# elif defined(__arc__)
+#  define __NR_copy_file_range 285
+# endif
+#endif /* __NR_copy_file_range */
+
+#ifndef __NR_statx
+# if defined(__x86_64__)
+#  define __NR_statx 332
+# elif defined(__i386__)
+#  define __NR_statx 383
+# elif defined(__aarch64__)
+#  define __NR_statx 397
+# elif defined(__arm__)
+#  define __NR_statx (UV_SYSCALL_BASE + 397)
+# elif defined(__ppc__)
+#  define __NR_statx 383
+# elif defined(__s390__)
+#  define __NR_statx 379
+# endif
+#endif /* __NR_statx */
+
+#ifndef __NR_getrandom
+# if defined(__x86_64__)
+#  define __NR_getrandom 318
+# elif defined(__i386__)
+#  define __NR_getrandom 355
+# elif defined(__aarch64__)
+#  define __NR_getrandom 384
+# elif defined(__arm__)
+#  define __NR_getrandom (UV_SYSCALL_BASE + 384)
+# elif defined(__ppc__)
+#  define __NR_getrandom 359
+# elif defined(__s390__)
+#  define __NR_getrandom 349
+# endif
+#endif /* __NR_getrandom */
 
 #define HAVE_IFADDRS_H 1
+
+# if defined(__ANDROID_API__) && __ANDROID_API__ < 24
+# undef HAVE_IFADDRS_H
+#endif
 
 #ifdef __UCLIBC__
 # if __UCLIBC_MAJOR__ < 0 && __UCLIBC_MINOR__ < 9 && __UCLIBC_SUBLEVEL__ < 32
@@ -52,11 +134,7 @@
 #endif
 
 #ifdef HAVE_IFADDRS_H
-# if defined(__ANDROID__)
-#  include "uv/android-ifaddrs.h"
-# else
-#  include <ifaddrs.h>
-# endif
+# include <ifaddrs.h>
 # include <sys/socket.h>
 # include <net/ethernet.h>
 # include <netpacket/packet.h>
@@ -75,6 +153,27 @@
 # define CLOCK_BOOTTIME 7
 #endif
 
+#define CAST(p) ((struct watcher_root*)(p))
+
+struct watcher_list {
+  RB_ENTRY(watcher_list) entry;
+  QUEUE watchers;
+  int iterating;
+  char* path;
+  int wd;
+};
+
+struct watcher_root {
+  struct watcher_list* rbh_root;
+};
+
+static void uv__inotify_read(uv_loop_t* loop,
+                             uv__io_t* w,
+                             unsigned int revents);
+static int compare_watchers(const struct watcher_list* a,
+                            const struct watcher_list* b);
+static void maybe_free_watcher_list(struct watcher_list* w,
+                                    uv_loop_t* loop);
 static int read_models(unsigned int numcpus, uv_cpu_info_t* ci);
 static int read_times(FILE* statfile_fp,
                       unsigned int numcpus,
@@ -82,29 +181,71 @@ static int read_times(FILE* statfile_fp,
 static void read_speeds(unsigned int numcpus, uv_cpu_info_t* ci);
 static uint64_t read_cpufreq(unsigned int cpunum);
 
+RB_GENERATE_STATIC(watcher_root, watcher_list, entry, compare_watchers)
+
+
+ssize_t
+uv__fs_copy_file_range(int fd_in,
+                       off_t* off_in,
+                       int fd_out,
+                       off_t* off_out,
+                       size_t len,
+                       unsigned int flags)
+{
+#ifdef __NR_copy_file_range
+  return syscall(__NR_copy_file_range,
+                 fd_in,
+                 off_in,
+                 fd_out,
+                 off_out,
+                 len,
+                 flags);
+#else
+  return errno = ENOSYS, -1;
+#endif
+}
+
+
+int uv__statx(int dirfd,
+              const char* path,
+              int flags,
+              unsigned int mask,
+              struct uv__statx* statxbuf) {
+#if !defined(__NR_statx) || defined(__ANDROID_API__) && __ANDROID_API__ < 30
+  return errno = ENOSYS, -1;
+#else
+  int rc;
+
+  rc = syscall(__NR_statx, dirfd, path, flags, mask, statxbuf);
+  if (rc >= 0)
+    uv__msan_unpoison(statxbuf, sizeof(*statxbuf));
+
+  return rc;
+#endif
+}
+
+
+ssize_t uv__getrandom(void* buf, size_t buflen, unsigned flags) {
+#if !defined(__NR_getrandom) || defined(__ANDROID_API__) && __ANDROID_API__ < 28
+  return errno = ENOSYS, -1;
+#else
+  ssize_t rc;
+
+  rc = syscall(__NR_getrandom, buf, buflen, flags);
+  if (rc >= 0)
+    uv__msan_unpoison(buf, buflen);
+
+  return rc;
+#endif
+}
+
 
 int uv__platform_loop_init(uv_loop_t* loop) {
-  int fd;
-  
-  
-  //fd = epoll_create1(O_CLOEXEC);
-
-  /* epoll_create1() can fail either because it's not implemented (old kernel)
-   * or because it doesn't understand the O_CLOEXEC flag.
-   */
-  // if (fd == -1 && (errno == ENOSYS || errno == EINVAL)) {
-  {
-    fd = epoll_create(256);
-
-    if (fd != -1)
-      uv__cloexec(fd, 1);
-  }
-
-  loop->backend_fd = fd;
-  loop->inotify_fd = -1;
   loop->inotify_watchers = NULL;
+  loop->inotify_fd = -1;
+  loop->backend_fd = epoll_create1(O_CLOEXEC);
 
-  if (fd == -1)
+  if (loop->backend_fd == -1)
     return UV__ERR(errno);
 
   return 0;
@@ -190,19 +331,6 @@ int uv__io_check_fd(uv_loop_t* loop, int fd) {
   return rc;
 }
 
-
-pthread_mutex_t uv__epoll_pwait_lock;
-static int uv__epoll_pwait(int epfd, struct epoll_event *events,int maxevents, int timeout,const sigset_t *sigmask){
-  sigset_t origmask;
-  pthread_mutex_init(&uv__epoll_pwait_lock,NULL);
-  pthread_mutex_lock(&uv__epoll_pwait_lock);
-  pthread_sigmask(SIG_SETMASK, sigmask, &origmask);
-  int ready = epoll_wait(epfd, events, maxevents, timeout);
-  pthread_sigmask(SIG_SETMASK, &origmask, NULL);
-  pthread_mutex_unlock(&uv__epoll_pwait_lock);
-  pthread_mutex_destroy(&uv__epoll_pwait_lock);
-  return ready;
-}
 
 void uv__io_poll(uv_loop_t* loop, int timeout) {
   /* A bug in kernels < 2.6.37 makes timeouts larger than ~30 minutes
@@ -327,7 +455,7 @@ void uv__io_poll(uv_loop_t* loop, int timeout) {
         abort();
 
     if (no_epoll_wait != 0 || (sigmask != 0 && no_epoll_pwait == 0)) {
-      nfds = uv__epoll_pwait(loop->backend_fd,
+      nfds = epoll_pwait(loop->backend_fd,
                          events,
                          ARRAY_SIZE(events),
                          timeout,
@@ -524,7 +652,6 @@ update_timeout:
   }
 }
 
-
 uint64_t uv__hrtime(uv_clocktype_t type) {
   static clock_t fast_clock_id = -1;
   struct timespec t;
@@ -618,31 +745,6 @@ err:
   return UV_EINVAL;
 }
 
-static int uv__slurp(const char* filename, char* buf, size_t len) {
-  ssize_t n;
-  int fd;
-
-  assert(len > 0);
-
-  fd = uv__open_cloexec(filename, O_RDONLY);
-  if (fd < 0)
-    return fd;
-
-  do
-    n = read(fd, buf, len - 1);
-  while (n == -1 && errno == EINTR);
-
-  if (uv__close_nocheckstdio(fd))
-    abort();
-
-  if (n < 0)
-    return UV__ERR(errno);
-
-  buf[n] = '\0';
-
-  return 0;
-}
-
 int uv_uptime(double* uptime) {
   static volatile int no_clock_boottime;
   char buf[128];
@@ -650,7 +752,7 @@ int uv_uptime(double* uptime) {
   int r;
 
   /* Try /proc/uptime first, then fallback to clock_gettime(). */
-  
+
   if (0 == uv__slurp("/proc/uptime", buf, sizeof(buf)))
     if (1 == sscanf(buf, "%lf", uptime))
       return 0;
@@ -756,35 +858,47 @@ static void read_speeds(unsigned int numcpus, uv_cpu_info_t* ci) {
 }
 
 
-/* Also reads the CPU frequency on x86. The other architectures only have
- * a BogoMIPS field, which may not be very accurate.
+/* Also reads the CPU frequency on ppc and x86. The other architectures only
+ * have a BogoMIPS field, which may not be very accurate.
  *
  * Note: Simply returns on error, uv_cpu_info() takes care of the cleanup.
  */
 static int read_models(unsigned int numcpus, uv_cpu_info_t* ci) {
+#if defined(__PPC__)
+  static const char model_marker[] = "cpu\t\t: ";
+  static const char speed_marker[] = "clock\t\t: ";
+#else
   static const char model_marker[] = "model name\t: ";
   static const char speed_marker[] = "cpu MHz\t\t: ";
+#endif
   const char* inferred_model;
   unsigned int model_idx;
   unsigned int speed_idx;
+  unsigned int part_idx;
   char buf[1024];
   char* model;
   FILE* fp;
+  int model_id;
 
   /* Most are unused on non-ARM, non-MIPS and non-x86 architectures. */
   (void) &model_marker;
   (void) &speed_marker;
   (void) &speed_idx;
+  (void) &part_idx;
   (void) &model;
   (void) &buf;
   (void) &fp;
+  (void) &model_id;
 
   model_idx = 0;
   speed_idx = 0;
+  part_idx = 0;
 
 #if defined(__arm__) || \
     defined(__i386__) || \
     defined(__mips__) || \
+    defined(__aarch64__) || \
+    defined(__PPC__) || \
     defined(__x86_64__)
   fp = uv__open_file("/proc/cpuinfo");
   if (fp == NULL)
@@ -803,11 +917,96 @@ static int read_models(unsigned int numcpus, uv_cpu_info_t* ci) {
         continue;
       }
     }
-#if defined(__arm__) || defined(__mips__)
+#if defined(__arm__) || defined(__mips__) || defined(__aarch64__)
     if (model_idx < numcpus) {
 #if defined(__arm__)
       /* Fallback for pre-3.8 kernels. */
       static const char model_marker[] = "Processor\t: ";
+#elif defined(__aarch64__)
+      static const char part_marker[] = "CPU part\t: ";
+
+      /* Adapted from: https://github.com/karelzak/util-linux */
+      struct vendor_part {
+        const int id;
+        const char* name;
+      };
+
+      static const struct vendor_part arm_chips[] = {
+        { 0x811, "ARM810" },
+        { 0x920, "ARM920" },
+        { 0x922, "ARM922" },
+        { 0x926, "ARM926" },
+        { 0x940, "ARM940" },
+        { 0x946, "ARM946" },
+        { 0x966, "ARM966" },
+        { 0xa20, "ARM1020" },
+        { 0xa22, "ARM1022" },
+        { 0xa26, "ARM1026" },
+        { 0xb02, "ARM11 MPCore" },
+        { 0xb36, "ARM1136" },
+        { 0xb56, "ARM1156" },
+        { 0xb76, "ARM1176" },
+        { 0xc05, "Cortex-A5" },
+        { 0xc07, "Cortex-A7" },
+        { 0xc08, "Cortex-A8" },
+        { 0xc09, "Cortex-A9" },
+        { 0xc0d, "Cortex-A17" },  /* Originally A12 */
+        { 0xc0f, "Cortex-A15" },
+        { 0xc0e, "Cortex-A17" },
+        { 0xc14, "Cortex-R4" },
+        { 0xc15, "Cortex-R5" },
+        { 0xc17, "Cortex-R7" },
+        { 0xc18, "Cortex-R8" },
+        { 0xc20, "Cortex-M0" },
+        { 0xc21, "Cortex-M1" },
+        { 0xc23, "Cortex-M3" },
+        { 0xc24, "Cortex-M4" },
+        { 0xc27, "Cortex-M7" },
+        { 0xc60, "Cortex-M0+" },
+        { 0xd01, "Cortex-A32" },
+        { 0xd03, "Cortex-A53" },
+        { 0xd04, "Cortex-A35" },
+        { 0xd05, "Cortex-A55" },
+        { 0xd06, "Cortex-A65" },
+        { 0xd07, "Cortex-A57" },
+        { 0xd08, "Cortex-A72" },
+        { 0xd09, "Cortex-A73" },
+        { 0xd0a, "Cortex-A75" },
+        { 0xd0b, "Cortex-A76" },
+        { 0xd0c, "Neoverse-N1" },
+        { 0xd0d, "Cortex-A77" },
+        { 0xd0e, "Cortex-A76AE" },
+        { 0xd13, "Cortex-R52" },
+        { 0xd20, "Cortex-M23" },
+        { 0xd21, "Cortex-M33" },
+        { 0xd41, "Cortex-A78" },
+        { 0xd42, "Cortex-A78AE" },
+        { 0xd4a, "Neoverse-E1" },
+        { 0xd4b, "Cortex-A78C" },
+      };
+
+      if (strncmp(buf, part_marker, sizeof(part_marker) - 1) == 0) {
+        model = buf + sizeof(part_marker) - 1;
+
+        errno = 0;
+        model_id = strtol(model, NULL, 16);
+        if ((errno != 0) || model_id < 0) {
+          fclose(fp);
+          return UV_EINVAL;
+        }
+
+        for (part_idx = 0; part_idx < ARRAY_SIZE(arm_chips); part_idx++) {
+          if (model_id == arm_chips[part_idx].id) {
+            model = uv__strdup(arm_chips[part_idx].name);
+            if (model == NULL) {
+              fclose(fp);
+              return UV_ENOMEM;
+            }
+            ci[model_idx++].model = model;
+            break;
+          }
+        }
+      }
 #else	/* defined(__mips__) */
       static const char model_marker[] = "cpu model\t\t: ";
 #endif
@@ -822,18 +1021,18 @@ static int read_models(unsigned int numcpus, uv_cpu_info_t* ci) {
         continue;
       }
     }
-#else  /* !__arm__ && !__mips__ */
+#else  /* !__arm__ && !__mips__ && !__aarch64__ */
     if (speed_idx < numcpus) {
       if (strncmp(buf, speed_marker, sizeof(speed_marker) - 1) == 0) {
         ci[speed_idx++].speed = atoi(buf + sizeof(speed_marker) - 1);
         continue;
       }
     }
-#endif  /* __arm__ || __mips__ */
+#endif  /* __arm__ || __mips__ || __aarch64__ */
   }
 
   fclose(fp);
-#endif  /* __arm__ || __i386__ || __mips__ || __x86_64__ */
+#endif  /* __arm__ || __i386__ || __mips__ || __PPC__ || __x86_64__ || __aarch__ */
 
   /* Now we want to make sure that all the models contain *something* because
    * it's not safe to leave them as null. Copy the last entry unless there
@@ -871,9 +1070,9 @@ static int read_times(FILE* statfile_fp,
   char buf[1024];
 
   ticks = (unsigned int)sysconf(_SC_CLK_TCK);
-  multiplier = ((uint64_t)1000L / ticks);
   assert(ticks != (unsigned int) -1);
   assert(ticks != 0);
+  multiplier = ((uint64_t)1000L / ticks);
 
   rewind(statfile_fp);
 
@@ -951,6 +1150,7 @@ static uint64_t read_cpufreq(unsigned int cpunum) {
 }
 
 
+#ifdef HAVE_IFADDRS_H
 static int uv__ifaddr_exclude(struct ifaddrs *ent, int exclude_type) {
   if (!((ent->ifa_flags & IFF_UP) && (ent->ifa_flags & IFF_RUNNING)))
     return 1;
@@ -964,6 +1164,7 @@ static int uv__ifaddr_exclude(struct ifaddrs *ent, int exclude_type) {
     return exclude_type;
   return !exclude_type;
 }
+#endif
 
 int uv_interface_addresses(uv_interface_address_t** addresses, int* count) {
 #ifndef HAVE_IFADDRS_H
@@ -1098,7 +1299,7 @@ uint64_t uv_get_free_memory(void) {
   struct sysinfo info;
   uint64_t rc;
 
-  rc = uv__read_proc_meminfo("MemFree:");
+  rc = uv__read_proc_meminfo("MemAvailable:");
 
   if (rc != 0)
     return rc;
@@ -1126,27 +1327,61 @@ uint64_t uv_get_total_memory(void) {
 }
 
 
-static uint64_t uv__read_cgroups_uint64(const char* cgroup, const char* param) {
-  char filename[256];
+static uint64_t uv__read_uint64(const char* filename) {
   char buf[32];  /* Large enough to hold an encoded uint64_t. */
   uint64_t rc;
 
   rc = 0;
-  snprintf(filename, sizeof(filename), "/sys/fs/cgroup/%s/%s", cgroup, param);
   if (0 == uv__slurp(filename, buf, sizeof(buf)))
-    sscanf(buf, "%" PRIu64, &rc);
+    if (1 != sscanf(buf, "%" PRIu64, &rc))
+      if (0 == strcmp(buf, "max\n"))
+        rc = ~0ull;
 
   return rc;
 }
 
 
+/* This might return 0 if there was a problem getting the memory limit from
+ * cgroups. This is OK because a return value of 0 signifies that the memory
+ * limit is unknown.
+ */
+static uint64_t uv__get_constrained_memory_fallback(void) {
+  return uv__read_uint64("/sys/fs/cgroup/memory/memory.limit_in_bytes");
+}
+
+
 uint64_t uv_get_constrained_memory(void) {
-  /*
-   * This might return 0 if there was a problem getting the memory limit from
-   * cgroups. This is OK because a return value of 0 signifies that the memory
-   * limit is unknown.
-   */
-  return uv__read_cgroups_uint64("memory", "memory.limit_in_bytes");
+  char filename[4097];
+  char buf[1024];
+  uint64_t high;
+  uint64_t max;
+  char* p;
+
+  if (uv__slurp("/proc/self/cgroup", buf, sizeof(buf)))
+    return uv__get_constrained_memory_fallback();
+
+  if (memcmp(buf, "0::/", 4))
+    return uv__get_constrained_memory_fallback();
+
+  p = strchr(buf, '\n');
+  if (p != NULL)
+    *p = '\0';
+
+  p = buf + 4;
+
+  snprintf(filename, sizeof(filename), "/sys/fs/cgroup/%s/memory.max", p);
+  max = uv__read_uint64(filename);
+
+  if (max == 0)
+    return uv__get_constrained_memory_fallback();
+
+  snprintf(filename, sizeof(filename), "/sys/fs/cgroup/%s/memory.high", p);
+  high = uv__read_uint64(filename);
+
+  if (high == 0)
+    return uv__get_constrained_memory_fallback();
+
+  return high < max ? high : max;
 }
 
 
@@ -1164,4 +1399,362 @@ void uv_loadavg(double avg[3]) {
   avg[0] = (double) info.loads[0] / 65536.0;
   avg[1] = (double) info.loads[1] / 65536.0;
   avg[2] = (double) info.loads[2] / 65536.0;
+}
+
+
+static int compare_watchers(const struct watcher_list* a,
+                            const struct watcher_list* b) {
+  if (a->wd < b->wd) return -1;
+  if (a->wd > b->wd) return 1;
+  return 0;
+}
+
+
+static int init_inotify(uv_loop_t* loop) {
+  int fd;
+
+  if (loop->inotify_fd != -1)
+    return 0;
+
+  fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+  if (fd < 0)
+    return UV__ERR(errno);
+
+  loop->inotify_fd = fd;
+  uv__io_init(&loop->inotify_read_watcher, uv__inotify_read, loop->inotify_fd);
+  uv__io_start(loop, &loop->inotify_read_watcher, POLLIN);
+
+  return 0;
+}
+
+
+int uv__inotify_fork(uv_loop_t* loop, void* old_watchers) {
+  /* Open the inotify_fd, and re-arm all the inotify watchers. */
+  int err;
+  struct watcher_list* tmp_watcher_list_iter;
+  struct watcher_list* watcher_list;
+  struct watcher_list tmp_watcher_list;
+  QUEUE queue;
+  QUEUE* q;
+  uv_fs_event_t* handle;
+  char* tmp_path;
+
+  if (old_watchers != NULL) {
+    /* We must restore the old watcher list to be able to close items
+     * out of it.
+     */
+    loop->inotify_watchers = old_watchers;
+
+    QUEUE_INIT(&tmp_watcher_list.watchers);
+    /* Note that the queue we use is shared with the start and stop()
+     * functions, making QUEUE_FOREACH unsafe to use. So we use the
+     * QUEUE_MOVE trick to safely iterate. Also don't free the watcher
+     * list until we're done iterating. c.f. uv__inotify_read.
+     */
+    RB_FOREACH_SAFE(watcher_list, watcher_root,
+                    CAST(&old_watchers), tmp_watcher_list_iter) {
+      watcher_list->iterating = 1;
+      QUEUE_MOVE(&watcher_list->watchers, &queue);
+      while (!QUEUE_EMPTY(&queue)) {
+        q = QUEUE_HEAD(&queue);
+        handle = QUEUE_DATA(q, uv_fs_event_t, watchers);
+        /* It's critical to keep a copy of path here, because it
+         * will be set to NULL by stop() and then deallocated by
+         * maybe_free_watcher_list
+         */
+        tmp_path = uv__strdup(handle->path);
+        assert(tmp_path != NULL);
+        QUEUE_REMOVE(q);
+        QUEUE_INSERT_TAIL(&watcher_list->watchers, q);
+        uv_fs_event_stop(handle);
+
+        QUEUE_INSERT_TAIL(&tmp_watcher_list.watchers, &handle->watchers);
+        handle->path = tmp_path;
+      }
+      watcher_list->iterating = 0;
+      maybe_free_watcher_list(watcher_list, loop);
+    }
+
+    QUEUE_MOVE(&tmp_watcher_list.watchers, &queue);
+    while (!QUEUE_EMPTY(&queue)) {
+        q = QUEUE_HEAD(&queue);
+        QUEUE_REMOVE(q);
+        handle = QUEUE_DATA(q, uv_fs_event_t, watchers);
+        tmp_path = handle->path;
+        handle->path = NULL;
+        err = uv_fs_event_start(handle, handle->cb, tmp_path, 0);
+        uv__free(tmp_path);
+        if (err)
+          return err;
+    }
+  }
+
+  return 0;
+}
+
+
+static struct watcher_list* find_watcher(uv_loop_t* loop, int wd) {
+  struct watcher_list w;
+  w.wd = wd;
+  return RB_FIND(watcher_root, CAST(&loop->inotify_watchers), &w);
+}
+
+
+static void maybe_free_watcher_list(struct watcher_list* w, uv_loop_t* loop) {
+  /* if the watcher_list->watchers is being iterated over, we can't free it. */
+  if ((!w->iterating) && QUEUE_EMPTY(&w->watchers)) {
+    /* No watchers left for this path. Clean up. */
+    RB_REMOVE(watcher_root, CAST(&loop->inotify_watchers), w);
+    inotify_rm_watch(loop->inotify_fd, w->wd);
+    uv__free(w);
+  }
+}
+
+
+static void uv__inotify_read(uv_loop_t* loop,
+                             uv__io_t* dummy,
+                             unsigned int events) {
+  const struct inotify_event* e;
+  struct watcher_list* w;
+  uv_fs_event_t* h;
+  QUEUE queue;
+  QUEUE* q;
+  const char* path;
+  ssize_t size;
+  const char *p;
+  /* needs to be large enough for sizeof(inotify_event) + strlen(path) */
+  char buf[4096];
+
+  for (;;) {
+    do
+      size = read(loop->inotify_fd, buf, sizeof(buf));
+    while (size == -1 && errno == EINTR);
+
+    if (size == -1) {
+      assert(errno == EAGAIN || errno == EWOULDBLOCK);
+      break;
+    }
+
+    assert(size > 0); /* pre-2.6.21 thing, size=0 == read buffer too small */
+
+    /* Now we have one or more inotify_event structs. */
+    for (p = buf; p < buf + size; p += sizeof(*e) + e->len) {
+      e = (const struct inotify_event*) p;
+
+      events = 0;
+      if (e->mask & (IN_ATTRIB|IN_MODIFY))
+        events |= UV_CHANGE;
+      if (e->mask & ~(IN_ATTRIB|IN_MODIFY))
+        events |= UV_RENAME;
+
+      w = find_watcher(loop, e->wd);
+      if (w == NULL)
+        continue; /* Stale event, no watchers left. */
+
+      /* inotify does not return the filename when monitoring a single file
+       * for modifications. Repurpose the filename for API compatibility.
+       * I'm not convinced this is a good thing, maybe it should go.
+       */
+      path = e->len ? (const char*) (e + 1) : uv__basename_r(w->path);
+
+      /* We're about to iterate over the queue and call user's callbacks.
+       * What can go wrong?
+       * A callback could call uv_fs_event_stop()
+       * and the queue can change under our feet.
+       * So, we use QUEUE_MOVE() trick to safely iterate over the queue.
+       * And we don't free the watcher_list until we're done iterating.
+       *
+       * First,
+       * tell uv_fs_event_stop() (that could be called from a user's callback)
+       * not to free watcher_list.
+       */
+      w->iterating = 1;
+      QUEUE_MOVE(&w->watchers, &queue);
+      while (!QUEUE_EMPTY(&queue)) {
+        q = QUEUE_HEAD(&queue);
+        h = QUEUE_DATA(q, uv_fs_event_t, watchers);
+
+        QUEUE_REMOVE(q);
+        QUEUE_INSERT_TAIL(&w->watchers, q);
+
+        h->cb(h, path, events, 0);
+      }
+      /* done iterating, time to (maybe) free empty watcher_list */
+      w->iterating = 0;
+      maybe_free_watcher_list(w, loop);
+    }
+  }
+}
+
+
+int uv_fs_event_init(uv_loop_t* loop, uv_fs_event_t* handle) {
+  uv__handle_init(loop, (uv_handle_t*)handle, UV_FS_EVENT);
+  return 0;
+}
+
+
+int uv_fs_event_start(uv_fs_event_t* handle,
+                      uv_fs_event_cb cb,
+                      const char* path,
+                      unsigned int flags) {
+  struct watcher_list* w;
+  size_t len;
+  int events;
+  int err;
+  int wd;
+
+  if (uv__is_active(handle))
+    return UV_EINVAL;
+
+  err = init_inotify(handle->loop);
+  if (err)
+    return err;
+
+  events = IN_ATTRIB
+         | IN_CREATE
+         | IN_MODIFY
+         | IN_DELETE
+         | IN_DELETE_SELF
+         | IN_MOVE_SELF
+         | IN_MOVED_FROM
+         | IN_MOVED_TO;
+
+  wd = inotify_add_watch(handle->loop->inotify_fd, path, events);
+  if (wd == -1)
+    return UV__ERR(errno);
+
+  w = find_watcher(handle->loop, wd);
+  if (w)
+    goto no_insert;
+
+  len = strlen(path) + 1;
+  w = uv__malloc(sizeof(*w) + len);
+  if (w == NULL)
+    return UV_ENOMEM;
+
+  w->wd = wd;
+  w->path = memcpy(w + 1, path, len);
+  QUEUE_INIT(&w->watchers);
+  w->iterating = 0;
+  RB_INSERT(watcher_root, CAST(&handle->loop->inotify_watchers), w);
+
+no_insert:
+  uv__handle_start(handle);
+  QUEUE_INSERT_TAIL(&w->watchers, &handle->watchers);
+  handle->path = w->path;
+  handle->cb = cb;
+  handle->wd = wd;
+
+  return 0;
+}
+
+
+int uv_fs_event_stop(uv_fs_event_t* handle) {
+  struct watcher_list* w;
+
+  if (!uv__is_active(handle))
+    return 0;
+
+  w = find_watcher(handle->loop, handle->wd);
+  assert(w != NULL);
+
+  handle->wd = -1;
+  handle->path = NULL;
+  uv__handle_stop(handle);
+  QUEUE_REMOVE(&handle->watchers);
+
+  maybe_free_watcher_list(w, handle->loop);
+
+  return 0;
+}
+
+
+void uv__fs_event_close(uv_fs_event_t* handle) {
+  uv_fs_event_stop(handle);
+}
+
+
+int uv__sendmmsg(int fd, struct uv__mmsghdr* mmsg, unsigned int vlen) {
+#if defined(__i386__)
+  unsigned long args[4];
+  int rc;
+
+  args[0] = (unsigned long) fd;
+  args[1] = (unsigned long) mmsg;
+  args[2] = (unsigned long) vlen;
+  args[3] = /* flags */ 0;
+
+  /* socketcall() raises EINVAL when SYS_SENDMMSG is not supported. */
+  rc = syscall(/* __NR_socketcall */ 102, 20 /* SYS_SENDMMSG */, args);
+  if (rc == -1)
+    if (errno == EINVAL)
+      errno = ENOSYS;
+
+  return rc;
+#elif defined(__NR_sendmmsg)
+  return syscall(__NR_sendmmsg, fd, mmsg, vlen, /* flags */ 0);
+#else
+  return errno = ENOSYS, -1;
+#endif
+}
+
+
+static void uv__recvmmsg_unpoison(struct uv__mmsghdr* mmsg, int rc) {
+  struct uv__mmsghdr* m;
+  struct msghdr* h;
+  struct iovec* v;
+  size_t j;
+  int i;
+
+  for (i = 0; i < rc; i++) {
+    m = mmsg + i;
+    uv__msan_unpoison(m, sizeof(*m));
+
+    h = &m->msg_hdr;
+    if (h->msg_name != NULL)
+      uv__msan_unpoison(h->msg_name, h->msg_namelen);
+
+    if (h->msg_iov != NULL)
+      uv__msan_unpoison(h->msg_iov, h->msg_iovlen * sizeof(*h->msg_iov));
+
+    for (j = 0; j < h->msg_iovlen; j++) {
+      v = h->msg_iov + j;
+      uv__msan_unpoison(v->iov_base, v->iov_len);
+    }
+
+    if (h->msg_control != NULL)
+      uv__msan_unpoison(h->msg_control, h->msg_controllen);
+  }
+}
+
+
+int uv__recvmmsg(int fd, struct uv__mmsghdr* mmsg, unsigned int vlen) {
+#if defined(__i386__)
+  unsigned long args[5];
+  int rc;
+
+  args[0] = (unsigned long) fd;
+  args[1] = (unsigned long) mmsg;
+  args[2] = (unsigned long) vlen;
+  args[3] = /* flags */ 0;
+  args[4] = /* timeout */ 0;
+
+  /* socketcall() raises EINVAL when SYS_RECVMMSG is not supported. */
+  rc = syscall(/* __NR_socketcall */ 102, 19 /* SYS_RECVMMSG */, args);
+  uv__recvmmsg_unpoison(mmsg, rc);
+  if (rc == -1)
+    if (errno == EINVAL)
+      errno = ENOSYS;
+
+  return rc;
+#elif defined(__NR_recvmmsg)
+  int rc;
+
+  rc = syscall(__NR_recvmmsg, fd, mmsg, vlen, /* flags */ 0, /* timeout */ 0);
+  uv__recvmmsg_unpoison(mmsg, rc);
+
+  return rc;
+#else
+  return errno = ENOSYS, -1;
+#endif
 }
